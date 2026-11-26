@@ -40,14 +40,19 @@ type Upstream struct {
 }
 
 type Chaos struct {
-	Enabled             bool        `yaml:"enabled"`
-	RequestDelay        Delay       `yaml:"request_delay"`
-	ResponseDelay       Delay       `yaml:"response_delay"`
-	Abort               Feature     `yaml:"abort"`
-	Probability         Probability `yaml:"probability"`
-	Limits              Limits      `yaml:"limits"`
-	StripControlHeaders bool        `yaml:"strip_control_headers"`
-	Token               string      `yaml:"-"`
+	Enabled             bool            `yaml:"enabled"`
+	RequestDelay        Delay           `yaml:"request_delay"`
+	ResponseDelay       Delay           `yaml:"response_delay"`
+	Abort               Feature         `yaml:"abort"`
+	Probability         Probability     `yaml:"probability"`
+	RequestJitter       Feature         `yaml:"request_jitter"`
+	ResponseJitter      Feature         `yaml:"response_jitter"`
+	RequestBandwidth    Feature         `yaml:"request_bandwidth"`
+	ResponseBandwidth   Feature         `yaml:"response_bandwidth"`
+	ConnectionReset     ConnectionReset `yaml:"connection_reset"`
+	Limits              Limits          `yaml:"limits"`
+	StripControlHeaders bool            `yaml:"strip_control_headers"`
+	Token               string          `yaml:"-"`
 }
 
 type Delay struct {
@@ -62,6 +67,23 @@ type Feature struct {
 type Probability struct {
 	Enabled bool    `yaml:"enabled"`
 	Default float64 `yaml:"default"`
+}
+
+type ConnectionReset struct {
+	Enabled    bool      `yaml:"enabled"`
+	AfterBytes byteCount `yaml:"after_bytes"`
+}
+
+// byteCount rejects the implicit float-to-integer conversion in yaml.v3.
+type byteCount int64
+
+func (count *byteCount) UnmarshalYAML(node *yaml.Node) error {
+	var value int64
+	if node.ShortTag() != "!!int" || node.Decode(&value) != nil {
+		return errors.New("chaos.connection_reset.after_bytes must be a signed 64-bit integer")
+	}
+	*count = byteCount(value)
+	return nil
 }
 
 type Limits struct {
@@ -188,6 +210,12 @@ func (cfg *Config) applyEnvironment(lookup func(string) (string, bool)) error {
 		{"CHAOS_ABORT_ENABLED", &cfg.Chaos.Abort.Enabled},
 		{"CHAOS_PROBABILITY_ENABLED", &cfg.Chaos.Probability.Enabled},
 		{"CHAOS_PROBABILITY_DEFAULT", &cfg.Chaos.Probability.Default},
+		{"CHAOS_REQUEST_JITTER_ENABLED", &cfg.Chaos.RequestJitter.Enabled},
+		{"CHAOS_RESPONSE_JITTER_ENABLED", &cfg.Chaos.ResponseJitter.Enabled},
+		{"CHAOS_REQUEST_BANDWIDTH_ENABLED", &cfg.Chaos.RequestBandwidth.Enabled},
+		{"CHAOS_RESPONSE_BANDWIDTH_ENABLED", &cfg.Chaos.ResponseBandwidth.Enabled},
+		{"CHAOS_CONNECTION_RESET_ENABLED", &cfg.Chaos.ConnectionReset.Enabled},
+		{"CHAOS_CONNECTION_RESET_AFTER_BYTES", &cfg.Chaos.ConnectionReset.AfterBytes},
 		{"CHAOS_MAX_ACTIVE_FAULTS", &cfg.Chaos.Limits.MaxActiveFaults},
 		{"CHAOS_STRIP_CONTROL_HEADERS", &cfg.Chaos.StripControlHeaders},
 		{"CHAOS_TOKEN", &cfg.Chaos.Token},
@@ -219,6 +247,11 @@ func applyEnvironmentValue(target any, value string) error {
 	case *int:
 		*p, err = strconv.Atoi(value)
 		expected = "an integer"
+	case *byteCount:
+		var count int64
+		count, err = strconv.ParseInt(value, 10, 64)
+		*p = byteCount(count)
+		expected = "a signed 64-bit integer"
 	case *float64:
 		*p, err = strconv.ParseFloat(value, 64)
 		expected = "a number"
@@ -284,14 +317,11 @@ func (cfg Config) Validate() error {
 	if !cfg.Chaos.StripControlHeaders {
 		return errors.New("chaos.strip_control_headers must be true")
 	}
-	if cfg.Chaos.Abort.Enabled {
-		return errors.New("chaos.abort.enabled is unsupported and must be false")
-	}
-	if cfg.Chaos.Probability.Enabled {
-		return errors.New("chaos.probability.enabled is unsupported and must be false")
-	}
 	if p := cfg.Chaos.Probability.Default; math.IsNaN(p) || p < 0 || p > 1 {
 		return errors.New("chaos.probability.default must be between 0 and 1")
+	}
+	if cfg.Chaos.ConnectionReset.AfterBytes < 0 {
+		return errors.New("chaos.connection_reset.after_bytes must be nonnegative")
 	}
 	if cfg.Chaos.Token != "" && !validToken(cfg.Chaos.Token) {
 		return errors.New("CHAOS_TOKEN must be a single visible HTTP header value without a comma or leading or trailing spaces")

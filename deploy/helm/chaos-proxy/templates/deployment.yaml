@@ -1,3 +1,13 @@
+{{- $afterBytes := .Values.chaos.connectionReset.afterBytes -}}
+{{- if kindIs "float64" $afterBytes -}}
+  {{- if ge $afterBytes 9007199254740992.0 -}}
+    {{- fail "Quote chaos.connectionReset.afterBytes values of 9007199254740992 or greater to preserve integer precision" -}}
+  {{- end -}}
+  {{- if ne $afterBytes (floor $afterBytes) -}}
+    {{- fail "chaos.connectionReset.afterBytes must be a whole number" -}}
+  {{- end -}}
+  {{- $afterBytes = printf "%.0f" $afterBytes -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,6 +50,24 @@ spec:
               value: {{ required "upstreamURL must point to the backend Service" .Values.upstreamURL | quote }}
             - name: CHAOS_ENABLED
               value: {{ not (empty .Values.chaos.existingSecret.name) | quote }}
+            - name: CHAOS_ABORT_ENABLED
+              value: {{ .Values.chaos.abort.enabled | quote }}
+            - name: CHAOS_PROBABILITY_ENABLED
+              value: {{ .Values.chaos.probability.enabled | quote }}
+            - name: CHAOS_PROBABILITY_DEFAULT
+              value: {{ .Values.chaos.probability.default | quote }}
+            - name: CHAOS_REQUEST_JITTER_ENABLED
+              value: {{ .Values.chaos.requestJitter.enabled | quote }}
+            - name: CHAOS_RESPONSE_JITTER_ENABLED
+              value: {{ .Values.chaos.responseJitter.enabled | quote }}
+            - name: CHAOS_REQUEST_BANDWIDTH_ENABLED
+              value: {{ .Values.chaos.requestBandwidth.enabled | quote }}
+            - name: CHAOS_RESPONSE_BANDWIDTH_ENABLED
+              value: {{ .Values.chaos.responseBandwidth.enabled | quote }}
+            - name: CHAOS_CONNECTION_RESET_ENABLED
+              value: {{ .Values.chaos.connectionReset.enabled | quote }}
+            - name: CHAOS_CONNECTION_RESET_AFTER_BYTES
+              value: {{ $afterBytes | quote }}
             {{- with .Values.chaos.existingSecret.name }}
             - name: CHAOS_TOKEN
               valueFrom:

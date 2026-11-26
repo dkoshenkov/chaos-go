@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,65 @@ observability:
 	}
 }
 
+func TestAdvancedChaosConfig(t *testing.T) {
+	path := writeConfig(t, `upstream:
+  url: http://example.invalid
+chaos:
+  abort:
+    enabled: true
+  probability:
+    enabled: true
+    default: 0.25
+  request_jitter:
+    enabled: true
+  response_jitter:
+    enabled: true
+  request_bandwidth:
+    enabled: true
+  response_bandwidth:
+    enabled: true
+  connection_reset:
+    enabled: true
+    after_bytes: 9223372036854775806
+`)
+	cfg, err := load(path, Overrides{}, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := defaults().Chaos
+	want.Abort.Enabled = true
+	want.Probability = Probability{Enabled: true, Default: 0.25}
+	want.RequestJitter.Enabled = true
+	want.ResponseJitter.Enabled = true
+	want.RequestBandwidth.Enabled = true
+	want.ResponseBandwidth.Enabled = true
+	want.ConnectionReset = ConnectionReset{Enabled: true, AfterBytes: math.MaxInt64 - 1}
+	if cfg.Chaos != want {
+		t.Errorf("from YAML got %+v, want %+v", cfg.Chaos, want)
+	}
+
+	cfg, err = load(path, Overrides{}, env(map[string]string{
+		"CHAOS_ABORT_ENABLED":                "false",
+		"CHAOS_PROBABILITY_ENABLED":          "false",
+		"CHAOS_PROBABILITY_DEFAULT":          "0",
+		"CHAOS_REQUEST_JITTER_ENABLED":       "false",
+		"CHAOS_RESPONSE_JITTER_ENABLED":      "false",
+		"CHAOS_REQUEST_BANDWIDTH_ENABLED":    "false",
+		"CHAOS_RESPONSE_BANDWIDTH_ENABLED":   "false",
+		"CHAOS_CONNECTION_RESET_ENABLED":     "false",
+		"CHAOS_CONNECTION_RESET_AFTER_BYTES": "9223372036854775807",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = defaults().Chaos
+	want.Probability.Default = 0
+	want.ConnectionReset.AfterBytes = math.MaxInt64
+	if cfg.Chaos != want {
+		t.Errorf("with environment overrides got %+v, want %+v", cfg.Chaos, want)
+	}
+}
+
 func TestInvalidStartupConfig(t *testing.T) {
 	tests := []struct {
 		name string
@@ -85,8 +145,16 @@ func TestInvalidStartupConfig(t *testing.T) {
 		{"bad log level", "observability:\n  logging:\n    level: all\n", nil, "slog"},
 		{"bad log format", "", map[string]string{"OBSERVABILITY_LOGGING_FORMAT": "csv"}, "observability.logging.format"},
 		{"forwarded controls", "", map[string]string{"CHAOS_STRIP_CONTROL_HEADERS": "false"}, "chaos.strip_control_headers"},
-		{"abort", "", map[string]string{"CHAOS_ABORT_ENABLED": "true"}, "chaos.abort.enabled"},
-		{"probability", "", map[string]string{"CHAOS_PROBABILITY_ENABLED": "true"}, "chaos.probability.enabled"},
+		{"bad enable flag", "", map[string]string{"CHAOS_REQUEST_JITTER_ENABLED": "sometimes"}, "CHAOS_REQUEST_JITTER_ENABLED"},
+		{"probability above one", "", map[string]string{"CHAOS_PROBABILITY_DEFAULT": "1.1"}, "chaos.probability.default"},
+		{"negative probability", "chaos:\n  probability:\n    default: -0.1\n", nil, "chaos.probability.default"},
+		{"NaN probability", "", map[string]string{"CHAOS_PROBABILITY_DEFAULT": "NaN"}, "chaos.probability.default"},
+		{"infinite probability", "chaos:\n  probability:\n    default: .inf\n", nil, "chaos.probability.default"},
+		{"negative reset threshold", "", map[string]string{"CHAOS_CONNECTION_RESET_AFTER_BYTES": "-1"}, "chaos.connection_reset.after_bytes"},
+		{"overflowing reset threshold", "", map[string]string{"CHAOS_CONNECTION_RESET_AFTER_BYTES": "9223372036854775808"}, "CHAOS_CONNECTION_RESET_AFTER_BYTES"},
+		{"overflowing YAML reset threshold", "chaos:\n  connection_reset:\n    after_bytes: 9223372036854775808\n", nil, "chaos.connection_reset.after_bytes"},
+		{"fractional reset threshold", "chaos:\n  connection_reset:\n    after_bytes: 1.5\n", nil, "chaos.connection_reset.after_bytes"},
+		{"unknown reset setting", "chaos:\n  connection_reset:\n    typo: true\n", nil, "field typo not found"},
 		{"tracing", "", map[string]string{"OBSERVABILITY_TRACING_ENABLED": "true"}, "observability.tracing.enabled"},
 		{"unsupported token syntax", "", map[string]string{"CHAOS_TOKEN": "secret,value"}, "CHAOS_TOKEN"},
 	}

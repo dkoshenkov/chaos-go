@@ -13,6 +13,23 @@ chaos:
   existingSecret:
     name: ""
     key: token
+  abort:
+    enabled: false
+  probability:
+    enabled: false
+    default: 1.0
+  requestJitter:
+    enabled: false
+  responseJitter:
+    enabled: false
+  requestBandwidth:
+    enabled: false
+  responseBandwidth:
+    enabled: false
+  connectionReset:
+    enabled: false
+    # Quote large byte counts to preserve their full integer precision in values files.
+    afterBytes: "0"
 
 resources:
   requests:

@@ -28,13 +28,22 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	defer transport.CloseIdleConnections()
 	observer := observability.New(logger)
 	settings := chaos.Settings{
-		Enabled:          cfg.Chaos.Enabled,
-		RequestEnabled:   cfg.Chaos.RequestDelay.Enabled,
-		ResponseEnabled:  cfg.Chaos.ResponseDelay.Enabled,
-		MaxRequestDelay:  cfg.Chaos.RequestDelay.Max,
-		MaxResponseDelay: cfg.Chaos.ResponseDelay.Max,
-		MaxActiveFaults:  cfg.Chaos.Limits.MaxActiveFaults,
-		Token:            cfg.Chaos.Token,
+		Enabled:                  cfg.Chaos.Enabled,
+		RequestEnabled:           cfg.Chaos.RequestDelay.Enabled,
+		ResponseEnabled:          cfg.Chaos.ResponseDelay.Enabled,
+		MaxRequestDelay:          cfg.Chaos.RequestDelay.Max,
+		MaxResponseDelay:         cfg.Chaos.ResponseDelay.Max,
+		AbortEnabled:             cfg.Chaos.Abort.Enabled,
+		ProbabilityEnabled:       cfg.Chaos.Probability.Enabled,
+		DefaultProbability:       cfg.Chaos.Probability.Default,
+		RequestJitterEnabled:     cfg.Chaos.RequestJitter.Enabled,
+		ResponseJitterEnabled:    cfg.Chaos.ResponseJitter.Enabled,
+		RequestBandwidthEnabled:  cfg.Chaos.RequestBandwidth.Enabled,
+		ResponseBandwidthEnabled: cfg.Chaos.ResponseBandwidth.Enabled,
+		ConnectionResetEnabled:   cfg.Chaos.ConnectionReset.Enabled,
+		ResetAfterBytes:          int64(cfg.Chaos.ConnectionReset.AfterBytes),
+		MaxActiveFaults:          cfg.Chaos.Limits.MaxActiveFaults,
+		Token:                    cfg.Chaos.Token,
 	}
 	proxyHandler, err := proxy.NewHandler(cfg.Upstream.URL, settings, transport, observer)
 	if err != nil {

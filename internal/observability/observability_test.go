@@ -22,8 +22,16 @@ func TestMetrics(t *testing.T) {
 	request.Delay("request", 100*time.Millisecond, 20*time.Millisecond)
 	request.Delay("response", 200*time.Millisecond, 100*time.Millisecond)
 	request.Delay("client-secret", time.Second, time.Second)
+	request.Wait("request", 0, 0, false, true)
+	request.Injection("abort", "response")
+	request.Injection("bandwidth", "response")
+	request.Injection("connection_reset", "response")
+	request.Injection("connection_reset", "request")
+	request.Injection("abort", "request")
+	request.Injection("client-secret", "request")
 	request.Upstream(30 * time.Millisecond)
 	request.Finish(0, true)
+	request.Injection("abort", "response")
 	request.Finish(0, true)
 	request.Fault(false)
 
@@ -37,6 +45,10 @@ func TestMetrics(t *testing.T) {
 		`chaos_proxy_requests_total{method="GET",status_code="400"} 1`,
 		`chaos_proxy_injections_total{direction="request",fault_type="delay"} 1`,
 		`chaos_proxy_injections_total{direction="response",fault_type="delay"} 1`,
+		`chaos_proxy_injections_total{direction="request",fault_type="jitter"} 1`,
+		`chaos_proxy_injections_total{direction="response",fault_type="abort"} 1`,
+		`chaos_proxy_injections_total{direction="response",fault_type="bandwidth"} 1`,
+		`chaos_proxy_injections_total{direction="response",fault_type="connection_reset"} 1`,
 		`chaos_proxy_requested_delay_seconds_sum{direction="request"} 0.1`,
 		`chaos_proxy_requested_delay_seconds_sum{direction="response"} 0.2`,
 		`chaos_proxy_injected_delay_seconds_sum{direction="request"} 0.02`,
@@ -49,8 +61,10 @@ func TestMetrics(t *testing.T) {
 		`chaos_proxy_active_requests 0`,
 		`chaos_proxy_active_faults 0`,
 	)
-	if strings.Contains(output, "client-secret") || strings.Contains(output, "CUSTOM") {
-		t.Fatal("scrape contains unbounded labels")
+	for _, invalid := range []string{"client-secret", "CUSTOM", `direction="request",fault_type="abort"`, `direction="request",fault_type="connection_reset"`} {
+		if strings.Contains(output, invalid) {
+			t.Errorf("scrape contains unexpected label combination %q", invalid)
+		}
 	}
 	if !strings.Contains(output, "# TYPE go_goroutines gauge\n") {
 		t.Fatal("scrape is missing Go runtime metrics")
@@ -125,6 +139,8 @@ func TestNilObserver(t *testing.T) {
 	request.Policy(time.Second, time.Second)
 	request.Fault(true)
 	request.Delay("request", time.Second, time.Second)
+	request.Wait("request", 0, 0, false, true)
+	request.Injection("abort", "response")
 	request.Upstream(time.Second)
 	request.Invalid()
 	request.Finish(http.StatusOK, false)

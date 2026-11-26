@@ -23,7 +23,7 @@ func New(upstream string) (http.Handler, error) {
 	return NewHandler(upstream, chaos.Settings{}, nil, nil)
 }
 
-// NewHandler returns a proxy with per-request delay controls and shared limits.
+// NewHandler returns a proxy with per-request fault controls and shared limits.
 func NewHandler(upstream string, settings chaos.Settings, transport http.RoundTripper, observer *observability.Observer) (http.Handler, error) {
 	target, err := url.Parse(upstream)
 	if err != nil {
@@ -38,6 +38,9 @@ func NewHandler(upstream string, settings chaos.Settings, transport http.RoundTr
 	if settings.MaxActiveFaults < 0 {
 		return nil, errors.New("maximum active faults must be nonnegative")
 	}
+	if settings.ResetAfterBytes < 0 {
+		return nil, errors.New("connection reset threshold must be nonnegative")
+	}
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
@@ -47,6 +50,10 @@ func NewHandler(upstream string, settings chaos.Settings, transport http.RoundTr
 			stripChaosFields(request.Out.Header)
 			stripForwardingFields(request.Out.Header)
 			rewriteRequestTrailers(request.Out)
+			state := exchangeFrom(request.Out.Context())
+			if bandwidth := state.policy.RequestBandwidth; bandwidth > 0 && request.Out.Body != nil && request.In.Body != http.NoBody {
+				request.Out.Body = state.limitBody(request.Out.Context(), "request", request.Out.Body, bandwidth)
+			}
 			request.SetURL(target)
 			request.SetXForwarded()
 		},
@@ -54,8 +61,15 @@ func NewHandler(upstream string, settings chaos.Settings, transport http.RoundTr
 		ModifyResponse: func(response *http.Response) error {
 			stripChaosFields(response.Header)
 			stripChaosFields(response.Trailer)
-			state := exchangeFrom(response.Request.Context())
-			return state.wait(response.Request.Context(), "response", state.policy.ResponseDelay)
+			ctx := response.Request.Context()
+			state := exchangeFrom(ctx)
+			if err := state.wait(ctx, "response"); err != nil {
+				return err
+			}
+			if bandwidth := state.policy.ResponseBandwidth; bandwidth > 0 && responseHasBody(response) {
+				response.Body = state.limitBody(ctx, "response", response.Body, bandwidth)
+			}
+			return nil
 		},
 		ErrorHandler: proxyError,
 		// The observer supplies the request log. Transport errors may contain
@@ -81,17 +95,28 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var stopBodyWatch func()
+	var slotHeld bool
 	state := &exchange{
 		request:     r,
 		observation: h.observer.Begin(r, h.upstream),
 	}
 	writer := &responseWriter{ResponseWriter: w}
 	defer func() {
+		if slotHeld {
+			defer func() { <-h.active }()
+		}
+		canceled := !state.reset && (state.delayCanceled || ctx.Err() != nil)
+		if stopBodyWatch != nil {
+			stopBodyWatch()
+		}
 		// ReverseProxy copies late trailers after the final body write.
 		stripChaosFields(writer.Header())
-		state.observation.Finish(writer.status, state.delayCanceled || r.Context().Err() != nil)
+		state.observation.Finish(writer.status, canceled)
 	}()
 
+	selected := false
 	if h.settings.Enabled && chaos.HasControls(r.Header) {
 		if !chaos.Authorized(r.Header, h.settings.Token) {
 			http.Error(writer, http.StatusText(http.StatusForbidden), http.StatusForbidden)
@@ -103,32 +128,80 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
-		state.policy = policy
 		state.observation.Policy(policy.RequestDelay, policy.ResponseDelay)
+		if policy.HasFault() && policy.Selected() {
+			state.policy = policy
+			selected = true
+		}
 	}
 
-	if r.Context().Err() != nil {
+	if ctx.Err() != nil {
 		return
 	}
-	if state.policy.RequestDelay > 0 || state.policy.ResponseDelay > 0 {
+	if selected {
 		select {
 		case h.active <- struct{}{}:
+			slotHeld = true
 			state.observation.Fault(true)
-			defer func() {
-				state.observation.Fault(false)
-				<-h.active
-			}()
 		default:
 			http.Error(writer, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 			return
 		}
+		sampled := state.policy.SampleJitter(h.settings)
+		state.requestDelay = sampled.RequestDelay
+		state.responseDelay = sampled.ResponseDelay
+		state.observation.Policy(sampled.RequestDelay, sampled.ResponseDelay)
 	}
 
-	if err := state.wait(r.Context(), "request", state.policy.RequestDelay); err != nil {
+	policy := state.policy
+	if policy.RequestBandwidth > 0 || policy.ResponseBandwidth > 0 {
+		ctx, stopBodyWatch = disconnect.WatchBody(ctx, r)
+	}
+	if err := state.wait(ctx, "request"); err != nil {
 		return
 	}
-	ctx := context.WithValue(r.Context(), exchangeKey{}, state)
-	h.reverse.ServeHTTP(writer, r.WithContext(ctx))
+	immediateReset := policy.ConnectionReset && h.settings.ResetAfterBytes == 0
+	if immediateReset || policy.StatusCode != 0 {
+		if err := state.wait(ctx, "response"); err != nil {
+			return
+		}
+		if immediateReset {
+			state.recordReset()
+			resetDownstream(w, r)
+			return
+		}
+		if r.ProtoMajor == 1 && r.Body != nil && r.Body != http.NoBody {
+			// Send the terminal status without waiting for the client to finish uploading.
+			writer.Header().Set("Connection", "close")
+		}
+		state.observation.Injection("abort", "response")
+		writer.WriteHeader(policy.StatusCode)
+		return
+	}
+
+	proxyCtx := context.WithValue(ctx, exchangeKey{}, state)
+	if policy.RequestBandwidth > 0 {
+		// Stop an outstanding upload wait when upstream responds without reading it.
+		var cancel context.CancelFunc
+		proxyCtx, cancel = context.WithCancel(proxyCtx)
+		defer cancel()
+	}
+	request := r.WithContext(proxyCtx)
+	reverse := h.reverse
+	if policy.ResponseBandwidth > 0 {
+		// Flush paced chunks even when the upstream supplies a Content-Length.
+		streaming := *reverse
+		streaming.FlushInterval = -1
+		reverse = &streaming
+	}
+	if policy.ConnectionReset {
+		resetter := resetAfterWriter(writer, request, h.settings.ResetAfterBytes, state.recordReset)
+		// ReverseProxy must close the upstream body before aborting the client.
+		defer resetter.abort()
+		reverse.ServeHTTP(resetter, request)
+		return
+	}
+	reverse.ServeHTTP(writer, request)
 }
 
 type exchangeKey struct{}
@@ -137,23 +210,68 @@ type exchange struct {
 	request       *http.Request
 	policy        chaos.Policy
 	observation   *observability.Request
+	requestDelay  time.Duration
+	responseDelay time.Duration
 	delayCanceled bool
+	reset         bool
 }
 
 func exchangeFrom(ctx context.Context) *exchange {
 	return ctx.Value(exchangeKey{}).(*exchange)
 }
 
-func (e *exchange) wait(ctx context.Context, direction string, delay time.Duration) error {
+func (e *exchange) wait(ctx context.Context, direction string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delay, base, jitter := e.requestDelay, e.policy.RequestDelay, e.policy.RequestJitter
+	if direction == "response" {
+		delay, base, jitter = e.responseDelay, e.policy.ResponseDelay, e.policy.ResponseJitter
+	}
 	if delay == 0 {
-		return ctx.Err()
+		if jitter > 0 {
+			e.observation.Wait(direction, 0, 0, false, true)
+		}
+		return nil
 	}
 
 	start := time.Now()
 	err := disconnect.Wait(ctx, e.request, delay)
 	e.delayCanceled = err != nil
-	e.observation.Delay(direction, delay, time.Since(start))
+	e.observation.Wait(direction, delay, time.Since(start), base > 0, jitter > 0)
 	return err
+}
+
+func (e *exchange) recordReset() {
+	e.reset = true
+	e.observation.Injection("connection_reset", "response")
+}
+
+func (e *exchange) limitBody(ctx context.Context, direction string, body io.ReadCloser, kbps int64) io.ReadCloser {
+	return limitBody(ctx, &observedBody{
+		ReadCloser: body,
+		onRead:     func() { e.observation.Injection("bandwidth", direction) },
+	}, kbps)
+}
+
+type observedBody struct {
+	io.ReadCloser
+	onRead func()
+}
+
+func (b *observedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 && b.onRead != nil {
+		b.onRead()
+		b.onRead = nil
+	}
+	return n, err
+}
+
+func responseHasBody(response *http.Response) bool {
+	return response.Body != nil && response.Body != http.NoBody &&
+		response.Request.Method != http.MethodHead && response.StatusCode >= 200 &&
+		response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusNotModified
 }
 
 type timedTransport struct {

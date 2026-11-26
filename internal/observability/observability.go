@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -55,7 +57,7 @@ func New(logger *slog.Logger) *Observer {
 		}),
 		injections: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "chaos_proxy_injections_total",
-			Help: "Total completed or interrupted delay waits.",
+			Help: "Total fault injections applied to proxy requests.",
 		}, []string{"fault_type", "direction"}),
 		injectedDelay: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "chaos_proxy_injected_delay_seconds",
@@ -100,10 +102,14 @@ func New(logger *slog.Logger) *Observer {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	for _, direction := range []string{"request", "response"} {
-		observer.injections.WithLabelValues("delay", direction)
+		for _, faultType := range []string{"delay", "jitter", "bandwidth"} {
+			observer.injections.WithLabelValues(faultType, direction)
+		}
 		observer.injectedDelay.WithLabelValues(direction)
 		observer.requestedDelay.WithLabelValues(direction)
 	}
+	observer.injections.WithLabelValues("abort", "response")
+	observer.injections.WithLabelValues("connection_reset", "response")
 	return observer
 }
 
@@ -112,7 +118,12 @@ func (o *Observer) MetricsHandler() http.Handler {
 	return promhttp.HandlerFor(o.registry, promhttp.HandlerOpts{})
 }
 
-// Request holds observability state owned by one request handler.
+type appliedFault struct {
+	Type      string `json:"fault_type"`
+	Direction string `json:"direction"`
+}
+
+// Request holds observability state for one proxy request.
 type Request struct {
 	observer         *Observer
 	ctx              context.Context
@@ -123,9 +134,13 @@ type Request struct {
 	requestDelay     time.Duration
 	responseDelay    time.Duration
 	upstreamDuration time.Duration
-	faultActive      bool
-	chaosApplied     bool
-	finished         bool
+
+	// The upstream transport may read the request and report bandwidth
+	// injection concurrently with response handling and completion.
+	mu            sync.Mutex
+	appliedFaults []appliedFault
+	faultActive   bool
+	finished      bool
 }
 
 // Begin records a request as active and returns its observation state.
@@ -137,6 +152,7 @@ func (o *Observer) Begin(r *http.Request, upstream string) *Request {
 	o.activeRequests.Inc()
 	state := &Request{observer: o, started: started, method: r.Method}
 	if o.logger != nil {
+		state.appliedFaults = []appliedFault{}
 		state.ctx = r.Context()
 		if r.URL != nil {
 			state.path = r.URL.EscapedPath()
@@ -157,7 +173,12 @@ func (r *Request) Policy(requestDelay, responseDelay time.Duration) {
 
 // Fault tracks whether the request holds a fault slot.
 func (r *Request) Fault(active bool) {
-	if r == nil || r.finished || r.faultActive == active {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished || r.faultActive == active {
 		return
 	}
 	r.faultActive = active
@@ -170,13 +191,56 @@ func (r *Request) Fault(active bool) {
 
 // Delay records an injection and the requested and elapsed durations of its wait.
 func (r *Request) Delay(direction string, requested, actual time.Duration) {
-	if r == nil || (direction != "request" && direction != "response") {
+	r.Wait(direction, requested, actual, true, false)
+}
+
+// Wait records the effective wait and the delay and jitter that produced it.
+func (r *Request) Wait(direction string, effective, actual time.Duration, baseDelay, jitter bool) {
+	if r == nil || !validDirection(direction) {
 		return
 	}
-	r.chaosApplied = true
-	r.observer.injections.WithLabelValues("delay", direction).Inc()
-	r.observer.requestedDelay.WithLabelValues(direction).Observe(requested.Seconds())
-	r.observer.injectedDelay.WithLabelValues(direction).Observe(actual.Seconds())
+	if baseDelay {
+		r.Injection("delay", direction)
+	}
+	if jitter {
+		r.Injection("jitter", direction)
+	}
+	if baseDelay || effective > 0 {
+		r.observer.requestedDelay.WithLabelValues(direction).Observe(effective.Seconds())
+		r.observer.injectedDelay.WithLabelValues(direction).Observe(actual.Seconds())
+	}
+}
+
+// Injection records an applied fault. It may be called by a streaming transport.
+func (r *Request) Injection(faultType, direction string) {
+	if r == nil || !validDirection(direction) {
+		return
+	}
+	switch faultType {
+	case "abort", "connection_reset":
+		if direction != "response" {
+			return
+		}
+	case "delay", "jitter", "bandwidth":
+	default:
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.observer.injections.WithLabelValues(faultType, direction).Inc()
+	if r.observer.logger != nil {
+		fault := appliedFault{Type: faultType, Direction: direction}
+		if !slices.Contains(r.appliedFaults, fault) {
+			r.appliedFaults = append(r.appliedFaults, fault)
+		}
+	}
+}
+
+func validDirection(direction string) bool {
+	return direction == "request" || direction == "response"
 }
 
 // Upstream records a completed upstream round trip through headers or a transport error.
@@ -198,12 +262,21 @@ func (r *Request) Invalid() {
 
 // Finish records the outcome, releases active gauges, and logs the request.
 func (r *Request) Finish(status int, canceled bool) {
-	if r == nil || r.finished {
+	if r == nil {
 		return
 	}
-	duration := time.Since(r.started)
-	r.Fault(false)
+	r.mu.Lock()
+	if r.finished {
+		r.mu.Unlock()
+		return
+	}
 	r.finished = true
+	if r.faultActive {
+		r.faultActive = false
+		r.observer.activeFaults.Dec()
+	}
+	r.mu.Unlock()
+	duration := time.Since(r.started)
 	r.observer.activeRequests.Dec()
 	r.observer.requests.WithLabelValues(methodLabel(r.method), statusLabel(status)).Inc()
 	r.observer.requestDuration.Observe(duration.Seconds())
@@ -216,7 +289,8 @@ func (r *Request) Finish(status int, canceled bool) {
 			slog.String("method", r.method),
 			slog.String("path", r.path),
 			slog.String("upstream", r.upstream),
-			slog.Bool("chaos_applied", r.chaosApplied),
+			slog.Bool("chaos_applied", len(r.appliedFaults) != 0),
+			slog.Any("applied_faults", r.appliedFaults),
 			slog.Float64("request_delay_ms", milliseconds(r.requestDelay)),
 			slog.Float64("response_delay_ms", milliseconds(r.responseDelay)),
 			slog.Float64("upstream_duration_ms", milliseconds(r.upstreamDuration)),
