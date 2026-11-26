@@ -1,0 +1,39 @@
+server:
+  listen: "127.0.0.1:8080"
+  read_header_timeout: 5s
+  idle_timeout: 120s
+  shutdown_timeout: 30s
+
+upstream:
+  url: "http://127.0.0.1:9000"
+  dial_timeout: 5s
+  response_header_timeout: 30s
+  max_idle_connections: 100
+  max_idle_connections_per_host: 100
+
+chaos:
+  enabled: true
+  request_delay:
+    enabled: true
+    max: 120s
+  response_delay:
+    enabled: true
+    max: 120s
+  abort:
+    enabled: false
+  probability:
+    enabled: false
+    default: 1.0
+  limits:
+    max_active_faults: 1000
+  strip_control_headers: true
+
+observability:
+  listen: "127.0.0.1:9090"
+  metrics:
+    enabled: true
+  logging:
+    level: info
+    format: json
+  tracing:
+    enabled: false

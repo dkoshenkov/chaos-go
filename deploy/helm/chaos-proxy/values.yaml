@@ -1,0 +1,23 @@
+replicaCount: 1
+
+image:
+  repository: chaos-proxy
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Point to the backend Service in the cluster.
+upstreamURL: http://backend:8080
+
+# Chaos is enabled when a Secret name is supplied. The Secret must exist in the release namespace.
+chaos:
+  existingSecret:
+    name: ""
+    key: token
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi

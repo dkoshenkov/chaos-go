@@ -1,0 +1,43 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: backend
+  namespace: default
+spec:
+  hosts:
+    - app.example.com
+  gateways:
+    - edge-gateway
+  http:
+    - name: chaos
+      match:
+        - headers:
+            x-chaos-enabled:
+              exact: "true"
+      retries:
+        attempts: 0
+      route:
+        - destination:
+            host: chaos-proxy.default.svc.cluster.local
+            port:
+              number: 8080
+    - name: backend
+      headers:
+        request:
+          remove:
+            - x-chaos-enabled
+            - x-chaos-token
+            - x-chaos-request-delay-ms
+            - x-chaos-response-delay-ms
+            - x-chaos-status-code
+            - x-chaos-probability
+            - x-chaos-request-bandwidth-kbps
+            - x-chaos-response-bandwidth-kbps
+            - x-chaos-request-jitter-ms
+            - x-chaos-response-jitter-ms
+            - x-chaos-connection-reset
+      route:
+        - destination:
+            host: backend.default.svc.cluster.local
+            port:
+              number: 8080
