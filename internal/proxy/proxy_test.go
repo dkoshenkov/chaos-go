@@ -23,7 +23,12 @@ func TestProxyForwardsRequestAndResponse(t *testing.T) {
 		if err != nil {
 			t.Errorf("read upstream request body: %v", err)
 		}
-		forwarded <- forwardedRequest{r.Method, r.Host, string(body), r.Header.Clone()}
+		forwarded <- forwardedRequest{
+			method: r.Method,
+			host:   r.Host,
+			body:   string(body),
+			header: r.Header.Clone(),
+		}
 
 		w.Header().Set("X-Upstream", "preserved")
 		w.Header().Set("Connection", "X-Response-Hop")
@@ -104,7 +109,12 @@ func TestProxyJoinsUpstreamAndRequestURLs(t *testing.T) {
 		{"no base path", "", "/items?sort=name", "/items?sort=name"},
 		{"base path", "/api/", "/items/42", "/api/items/42"},
 		{"root request", "/api", "/", "/api/"},
-		{"escaped paths and combined queries", "/api%2Fv1?origin=blue&shared=base", "/items%2F42/%2e?client=green&shared=incoming", "/api%2Fv1/items%2F42/%2e?origin=blue&shared=base&client=green&shared=incoming"},
+		{
+			name: "escaped paths and combined queries",
+			base: "/api%2Fv1?origin=blue&shared=base",
+			path: "/items%2F42/%2e?client=green&shared=incoming",
+			want: "/api%2Fv1/items%2F42/%2e?origin=blue&shared=base&client=green&shared=incoming",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -128,15 +138,8 @@ func TestProxyJoinsUpstreamAndRequestURLs(t *testing.T) {
 }
 
 func TestProxyReturnsBadGatewayOnUpstreamFailure(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		conn, _, err := http.NewResponseController(w).Hijack()
-		if err != nil {
-			t.Errorf("hijack upstream connection: %v", err)
-			return
-		}
-		if err := conn.Close(); err != nil {
-			t.Errorf("close upstream connection: %v", err)
-		}
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
 	}))
 	defer upstream.Close()
 
