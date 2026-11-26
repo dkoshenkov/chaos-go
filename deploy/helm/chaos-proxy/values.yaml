@@ -5,10 +5,17 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# Use http, tcp, or connect. The two tunnel modes take a TCP upstream address.
+mode: http
+
 # Point to the backend Service in the cluster.
 upstreamURL: http://backend:8080
 
-# Chaos is enabled when a Secret name is supplied. The Secret must exist in the release namespace.
+service:
+  port: 8080
+
+# HTTP and CONNECT chaos require a Secret in the release namespace.
+# TCP mode enables chaos when connectionReset.enabled is true.
 chaos:
   existingSecret:
     name: ""
@@ -30,6 +37,8 @@ chaos:
     enabled: false
     # Quote large byte counts to preserve their full integer precision in values files.
     afterBytes: "0"
+  tunnelTimeout:
+    max: 120s
 
 resources:
   requests:

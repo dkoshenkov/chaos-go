@@ -3,6 +3,7 @@ package observability
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -133,6 +134,89 @@ func TestRequestLog(t *testing.T) {
 	}
 }
 
+func TestTCPMetricsAndLog(t *testing.T) {
+	var logs bytes.Buffer
+	observer := New(slog.New(slog.NewJSONHandler(&logs, nil)))
+	connection := observer.BeginTCP()
+	assertSamples(t, scrapeMetrics(t, observer),
+		`chaos_proxy_tcp_active_connections 1`,
+		`chaos_proxy_tcp_connections_total{outcome="closed"} 0`,
+		`chaos_proxy_tcp_connections_total{outcome="timeout"} 0`,
+		`chaos_proxy_tcp_bytes_total{direction="client_to_upstream"} 0`,
+		`chaos_proxy_tcp_bytes_total{direction="upstream_to_client"} 0`,
+	)
+	connection.Finish("closed", 13, 21)
+	connection.Finish("closed", 42, 42)
+	observer.BeginTCP().Finish("client-secret", -1, 2)
+
+	metrics := scrapeMetrics(t, observer)
+	assertSamples(t, metrics,
+		`chaos_proxy_tcp_active_connections 0`,
+		`chaos_proxy_tcp_connections_total{outcome="closed"} 1`,
+		`chaos_proxy_tcp_connections_total{outcome="io_error"} 1`,
+		`chaos_proxy_tcp_bytes_total{direction="client_to_upstream"} 13`,
+		`chaos_proxy_tcp_bytes_total{direction="upstream_to_client"} 23`,
+		`chaos_proxy_tcp_connection_duration_seconds_count 2`,
+		`chaos_proxy_active_requests 0`,
+		`chaos_proxy_request_duration_seconds_count 0`,
+	)
+	if strings.Contains(metrics, "client-secret") || strings.Contains(logs.String(), "client-secret") {
+		t.Fatal("a TCP outcome escaped the allowlist")
+	}
+
+	decoder := json.NewDecoder(&logs)
+	var first, second map[string]any
+	if err := decoder.Decode(&first); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.Decode(&second); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		t.Fatalf("expected exactly two TCP completion logs, got %v", err)
+	}
+	for field, want := range map[string]any{
+		"msg":                      "proxy tcp connection",
+		"outcome":                  "closed",
+		"bytes_client_to_upstream": float64(13),
+		"bytes_upstream_to_client": float64(21),
+	} {
+		if got := first[field]; got != want {
+			t.Errorf("first TCP log field %q = %v, want %v", field, got, want)
+		}
+	}
+	if total, ok := first["total_duration_ms"].(float64); !ok || total < 0 {
+		t.Errorf("first TCP log has invalid total duration %v", first["total_duration_ms"])
+	}
+	if got := second["outcome"]; got != "io_error" {
+		t.Errorf("second TCP log outcome = %v, want io_error", got)
+	}
+}
+
+func TestTCPFaultMetrics(t *testing.T) {
+	observer := New(nil)
+	connection := observer.BeginTCP()
+	connection.Fault()
+	connection.Fault()
+	assertSamples(t, scrapeMetrics(t, observer), `chaos_proxy_active_faults 1`)
+
+	connection.Wait("response", 25*time.Millisecond, 20*time.Millisecond, true, true)
+	connection.Wait("client-secret", time.Second, time.Second, true, true)
+	connection.Finish("reset", 0, 10)
+	connection.Finish("reset", 0, 10)
+	connection.Wait("response", time.Second, time.Second, true, true)
+	connection.Fault()
+	assertSamples(t, scrapeMetrics(t, observer),
+		`chaos_proxy_active_faults 0`,
+		`chaos_proxy_injections_total{direction="response",fault_type="connection_reset"} 1`,
+		`chaos_proxy_injections_total{direction="response",fault_type="delay"} 1`,
+		`chaos_proxy_injections_total{direction="response",fault_type="jitter"} 1`,
+		`chaos_proxy_requested_delay_seconds_sum{direction="response"} 0.025`,
+		`chaos_proxy_injected_delay_seconds_sum{direction="response"} 0.02`,
+		`chaos_proxy_tcp_connections_total{outcome="reset"} 1`,
+	)
+}
+
 func TestNilObserver(t *testing.T) {
 	var observer *Observer
 	request := observer.Begin(nil, "")
@@ -144,6 +228,10 @@ func TestNilObserver(t *testing.T) {
 	request.Upstream(time.Second)
 	request.Invalid()
 	request.Finish(http.StatusOK, false)
+	connection := observer.BeginTCP()
+	connection.Fault()
+	connection.Wait("response", time.Second, time.Second, true, false)
+	connection.Finish("closed", 0, 0)
 }
 
 func scrapeMetrics(t *testing.T, observer *Observer) string {

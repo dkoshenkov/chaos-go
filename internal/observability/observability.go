@@ -30,9 +30,13 @@ type Observer struct {
 	activeFaults     prometheus.Gauge
 	canceledRequests prometheus.Counter
 	validationErrors prometheus.Counter
+	activeTCP        prometheus.Gauge
+	tcpConnections   *prometheus.CounterVec
+	tcpBytes         *prometheus.CounterVec
+	tcpDuration      prometheus.Histogram
 }
 
-// New creates an observer with a private Prometheus registry. A nil logger disables request logging.
+// New creates an observer with a private Prometheus registry. A nil logger disables completion logging.
 func New(logger *slog.Logger) *Observer {
 	buckets := []float64{
 		0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
@@ -57,7 +61,7 @@ func New(logger *slog.Logger) *Observer {
 		}),
 		injections: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "chaos_proxy_injections_total",
-			Help: "Total fault injections applied to proxy requests.",
+			Help: "Total fault injections applied to proxy requests and TCP connections.",
 		}, []string{"fault_type", "direction"}),
 		injectedDelay: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "chaos_proxy_injected_delay_seconds",
@@ -75,7 +79,7 @@ func New(logger *slog.Logger) *Observer {
 		}),
 		activeFaults: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "chaos_proxy_active_faults",
-			Help: "Requests currently holding a fault slot.",
+			Help: "Requests and TCP connections currently holding a fault slot.",
 		}),
 		canceledRequests: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "chaos_proxy_canceled_requests_total",
@@ -85,6 +89,23 @@ func New(logger *slog.Logger) *Observer {
 			Name:        "chaos_proxy_validation_errors_total",
 			Help:        "Total requests rejected for invalid fault policies.",
 			ConstLabels: prometheus.Labels{"reason": "invalid_policy"},
+		}),
+		activeTCP: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "chaos_proxy_tcp_active_connections",
+			Help: "TCP connections currently being handled.",
+		}),
+		tcpConnections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "chaos_proxy_tcp_connections_total",
+			Help: "Total TCP connections completed by outcome.",
+		}, []string{"outcome"}),
+		tcpBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "chaos_proxy_tcp_bytes_total",
+			Help: "Bytes forwarded by completed TCP connections by direction.",
+		}, []string{"direction"}),
+		tcpDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "chaos_proxy_tcp_connection_duration_seconds",
+			Help:    "Time spent handling a TCP connection from admission through completion.",
+			Buckets: buckets,
 		}),
 	}
 	observer.registry.MustRegister(
@@ -98,6 +119,10 @@ func New(logger *slog.Logger) *Observer {
 		observer.activeFaults,
 		observer.canceledRequests,
 		observer.validationErrors,
+		observer.activeTCP,
+		observer.tcpConnections,
+		observer.tcpBytes,
+		observer.tcpDuration,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -110,6 +135,11 @@ func New(logger *slog.Logger) *Observer {
 	}
 	observer.injections.WithLabelValues("abort", "response")
 	observer.injections.WithLabelValues("connection_reset", "response")
+	for _, outcome := range tcpOutcomes {
+		observer.tcpConnections.WithLabelValues(outcome)
+	}
+	observer.tcpBytes.WithLabelValues(clientToUpstream)
+	observer.tcpBytes.WithLabelValues(upstreamToClient)
 	return observer
 }
 
@@ -205,9 +235,13 @@ func (r *Request) Wait(direction string, effective, actual time.Duration, baseDe
 	if jitter {
 		r.Injection("jitter", direction)
 	}
+	r.observer.observeWait(direction, effective, actual, baseDelay)
+}
+
+func (o *Observer) observeWait(direction string, effective, actual time.Duration, baseDelay bool) {
 	if baseDelay || effective > 0 {
-		r.observer.requestedDelay.WithLabelValues(direction).Observe(effective.Seconds())
-		r.observer.injectedDelay.WithLabelValues(direction).Observe(actual.Seconds())
+		o.requestedDelay.WithLabelValues(direction).Observe(effective.Seconds())
+		o.injectedDelay.WithLabelValues(direction).Observe(actual.Seconds())
 	}
 }
 

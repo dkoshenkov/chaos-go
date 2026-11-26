@@ -26,11 +26,14 @@ COPY internal ./internal
 RUN --network=none CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -buildvcs=false \
     -ldflags="-s -w -X github.com/dkoshenkov/chaos-go/internal/server.version=$VERSION -X github.com/dkoshenkov/chaos-go/internal/server.commit=$COMMIT -X github.com/dkoshenkov/chaos-go/internal/server.buildDate=$BUILD_DATE" \
     -o /out/chaos-proxy ./cmd/chaos-proxy
+RUN --network=none CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -buildvcs=false \
+    -ldflags="-s -w" -o /out/chaos-tunnel ./cmd/chaos-tunnel
 
 FROM scratch
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/chaos-proxy /chaos-proxy
+COPY --from=build /out/chaos-tunnel /chaos-tunnel
 
 USER 65532:65532
 ENV SERVER_LISTEN=:8080

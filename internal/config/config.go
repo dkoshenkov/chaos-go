@@ -9,13 +9,23 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
+
+const (
+	ModeHTTP    = "http"
+	ModeTCP     = "tcp"
+	ModeConnect = "connect"
+)
+
+var errServerMode = errors.New("server.mode must be http, tcp, or connect")
 
 type Config struct {
 	Server        Server        `yaml:"server"`
@@ -25,6 +35,7 @@ type Config struct {
 }
 
 type Server struct {
+	Mode              string        `yaml:"mode"`
 	Listen            string        `yaml:"listen"`
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
@@ -50,6 +61,7 @@ type Chaos struct {
 	RequestBandwidth    Feature         `yaml:"request_bandwidth"`
 	ResponseBandwidth   Feature         `yaml:"response_bandwidth"`
 	ConnectionReset     ConnectionReset `yaml:"connection_reset"`
+	TunnelTimeout       TunnelTimeout   `yaml:"tunnel_timeout"`
 	Limits              Limits          `yaml:"limits"`
 	StripControlHeaders bool            `yaml:"strip_control_headers"`
 	Token               string          `yaml:"-"`
@@ -72,6 +84,10 @@ type Probability struct {
 type ConnectionReset struct {
 	Enabled    bool      `yaml:"enabled"`
 	AfterBytes byteCount `yaml:"after_bytes"`
+}
+
+type TunnelTimeout struct {
+	Max time.Duration `yaml:"max"`
 }
 
 // byteCount rejects the implicit float-to-integer conversion in yaml.v3.
@@ -104,6 +120,7 @@ type Logging struct {
 
 // Overrides contains explicitly supplied command-line flags.
 type Overrides struct {
+	Mode        *string
 	Listen      *string
 	UpstreamURL *string
 }
@@ -111,6 +128,7 @@ type Overrides struct {
 func defaults() Config {
 	return Config{
 		Server: Server{
+			Mode:              ModeHTTP,
 			Listen:            "127.0.0.1:8080",
 			ReadHeaderTimeout: 5 * time.Second,
 			IdleTimeout:       120 * time.Second,
@@ -127,6 +145,7 @@ func defaults() Config {
 			RequestDelay:        Delay{Enabled: true, Max: 120 * time.Second},
 			ResponseDelay:       Delay{Enabled: true, Max: 120 * time.Second},
 			Probability:         Probability{Default: 1},
+			TunnelTimeout:       TunnelTimeout{Max: 120 * time.Second},
 			Limits:              Limits{MaxActiveFaults: 1000},
 			StripControlHeaders: true,
 		},
@@ -154,11 +173,17 @@ func load(path string, overrides Overrides, lookupEnv func(string) (string, bool
 	if err := cfg.applyEnvironment(lookupEnv); err != nil {
 		return Config{}, err
 	}
+	if overrides.Mode != nil {
+		cfg.Server.Mode = *overrides.Mode
+	}
 	if overrides.Listen != nil {
 		cfg.Server.Listen = *overrides.Listen
 	}
 	if overrides.UpstreamURL != nil {
 		cfg.Upstream.URL = *overrides.UpstreamURL
+	}
+	if cfg.Server.Mode == "" {
+		return Config{}, errServerMode
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -193,6 +218,7 @@ func (cfg *Config) applyEnvironment(lookup func(string) (string, bool)) error {
 		name   string
 		target any
 	}{
+		{"SERVER_MODE", &cfg.Server.Mode},
 		{"SERVER_LISTEN", &cfg.Server.Listen},
 		{"SERVER_READ_HEADER_TIMEOUT", &cfg.Server.ReadHeaderTimeout},
 		{"SERVER_IDLE_TIMEOUT", &cfg.Server.IdleTimeout},
@@ -216,6 +242,7 @@ func (cfg *Config) applyEnvironment(lookup func(string) (string, bool)) error {
 		{"CHAOS_RESPONSE_BANDWIDTH_ENABLED", &cfg.Chaos.ResponseBandwidth.Enabled},
 		{"CHAOS_CONNECTION_RESET_ENABLED", &cfg.Chaos.ConnectionReset.Enabled},
 		{"CHAOS_CONNECTION_RESET_AFTER_BYTES", &cfg.Chaos.ConnectionReset.AfterBytes},
+		{"CHAOS_TUNNEL_TIMEOUT_MAX", &cfg.Chaos.TunnelTimeout.Max},
 		{"CHAOS_MAX_ACTIVE_FAULTS", &cfg.Chaos.Limits.MaxActiveFaults},
 		{"CHAOS_STRIP_CONTROL_HEADERS", &cfg.Chaos.StripControlHeaders},
 		{"CHAOS_TOKEN", &cfg.Chaos.Token},
@@ -270,6 +297,11 @@ func applyEnvironmentValue(target any, value string) error {
 
 // Validate checks the complete startup configuration.
 func (cfg Config) Validate() error {
+	switch cfg.Server.Mode {
+	case "", ModeHTTP, ModeTCP, ModeConnect:
+	default:
+		return errServerMode
+	}
 	proxyHost, _, err := net.SplitHostPort(cfg.Server.Listen)
 	if err != nil {
 		return errors.New("server.listen must be a host:port address")
@@ -279,6 +311,11 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.Upstream.URL == "" {
 		return errors.New("upstream.url is required via -upstream, UPSTREAM_URL, or -config")
+	}
+	if cfg.Server.Mode == ModeTCP || cfg.Server.Mode == ModeConnect {
+		if _, err := TCPAddress(cfg.Upstream.URL); err != nil {
+			return err
+		}
 	}
 	for _, bound := range []struct {
 		name  string
@@ -311,11 +348,11 @@ func (cfg Config) Validate() error {
 	if cfg.Chaos.ResponseDelay.Max < 0 {
 		return errors.New("chaos.response_delay.max must be nonnegative")
 	}
+	if cfg.Chaos.TunnelTimeout.Max < 0 {
+		return errors.New("chaos.tunnel_timeout.max must be nonnegative")
+	}
 	if cfg.Chaos.Limits.MaxActiveFaults <= 0 {
 		return errors.New("chaos.limits.max_active_faults must be positive")
-	}
-	if !cfg.Chaos.StripControlHeaders {
-		return errors.New("chaos.strip_control_headers must be true")
 	}
 	if p := cfg.Chaos.Probability.Default; math.IsNaN(p) || p < 0 || p > 1 {
 		return errors.New("chaos.probability.default must be between 0 and 1")
@@ -323,13 +360,18 @@ func (cfg Config) Validate() error {
 	if cfg.Chaos.ConnectionReset.AfterBytes < 0 {
 		return errors.New("chaos.connection_reset.after_bytes must be nonnegative")
 	}
-	if cfg.Chaos.Token != "" && !validToken(cfg.Chaos.Token) {
-		return errors.New("CHAOS_TOKEN must be a single visible HTTP header value without a comma or leading or trailing spaces")
-	}
-	if cfg.Chaos.Enabled && cfg.Chaos.Token == "" {
-		ip, err := netip.ParseAddr(proxyHost)
-		if err != nil || !ip.Unmap().IsLoopback() {
-			return errors.New("CHAOS_TOKEN is required when chaos is enabled and server.listen is not a literal loopback address")
+	if cfg.Server.Mode != ModeTCP {
+		if !cfg.Chaos.StripControlHeaders {
+			return errors.New("chaos.strip_control_headers must be true")
+		}
+		if cfg.Chaos.Token != "" && !validToken(cfg.Chaos.Token) {
+			return errors.New("CHAOS_TOKEN must be a single visible HTTP header value without a comma or leading or trailing spaces")
+		}
+		if cfg.Chaos.Enabled && cfg.Chaos.Token == "" {
+			ip, err := netip.ParseAddr(proxyHost)
+			if err != nil || !ip.Unmap().IsLoopback() {
+				return errors.New("CHAOS_TOKEN is required when chaos is enabled and server.listen is not a literal loopback address")
+			}
 		}
 	}
 	if cfg.Observability.Tracing.Enabled {
@@ -339,6 +381,62 @@ func (cfg Config) Validate() error {
 		return errors.New("observability.logging.format must be json or text")
 	}
 	return nil
+}
+
+// TCPAddress validates a fixed TCP upstream and returns an address suitable for dialing.
+func TCPAddress(raw string) (string, error) {
+	invalid := errors.New("upstream.url must be a TCP host:port address or tcp://host:port with a concrete host and numeric port 1-65535")
+	address, isURL := strings.CutPrefix(raw, "tcp://")
+	if strings.ContainsAny(address, "/?#@") || strings.ContainsFunc(address, func(ch rune) bool {
+		return unicode.IsSpace(ch) || unicode.IsControl(ch)
+	}) {
+		return "", invalid
+	}
+	if isURL {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return "", invalid
+		}
+		address = parsed.Host
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", invalid
+	}
+	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
+		return "", invalid
+	}
+	bracketed := strings.HasPrefix(address, "[")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is6() != bracketed || ip.Unmap().IsUnspecified() {
+			return "", invalid
+		}
+	} else if bracketed || !validHostname(host) {
+		return "", invalid
+	}
+	return address, nil
+}
+
+func validHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if len(host) > 253 {
+		return false
+	}
+	for label := range strings.SplitSeq(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		if strings.ContainsFunc(label, func(ch rune) bool {
+			switch {
+			case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9', ch == '-', ch == '_':
+				return false
+			}
+			return true
+		}) {
+			return false
+		}
+	}
+	return true
 }
 
 func validToken(token string) bool {

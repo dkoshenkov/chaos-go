@@ -15,6 +15,7 @@ CHART := deploy/helm/chaos-proxy
 
 build:
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/chaos-proxy ./cmd/chaos-proxy
+	$(GO) build -trimpath -o $(BIN_DIR)/chaos-tunnel ./cmd/chaos-tunnel
 
 test:
 	$(GO) test -race ./...

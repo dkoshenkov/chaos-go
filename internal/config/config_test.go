@@ -71,6 +71,47 @@ observability:
 	}
 }
 
+func TestLoadTunnelModes(t *testing.T) {
+	path := writeConfig(t, `server:
+  mode: connect
+upstream:
+  url: tcp://backend:5432
+chaos:
+  tunnel_timeout:
+    max: 10s
+`)
+	cfg, err := load(path, Overrides{}, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Mode != ModeConnect || cfg.Chaos.TunnelTimeout.Max != 10*time.Second {
+		t.Fatalf("YAML mode = %q, timeout max = %s", cfg.Server.Mode, cfg.Chaos.TunnelTimeout.Max)
+	}
+
+	vars := env(map[string]string{
+		"SERVER_MODE":              ModeTCP,
+		"UPSTREAM_URL":             "backend:6432",
+		"CHAOS_TUNNEL_TIMEOUT_MAX": "15s",
+	})
+	cfg, err = load(path, Overrides{}, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Mode != ModeTCP || cfg.Upstream.URL != "backend:6432" || cfg.Chaos.TunnelTimeout.Max != 15*time.Second {
+		t.Fatalf("env mode = %q, upstream = %q, timeout max = %s", cfg.Server.Mode, cfg.Upstream.URL, cfg.Chaos.TunnelTimeout.Max)
+	}
+
+	mode := ModeHTTP
+	upstream := "http://backend:8080"
+	cfg, err = load(path, Overrides{Mode: &mode, UpstreamURL: &upstream}, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Mode != ModeHTTP || cfg.Upstream.URL != upstream {
+		t.Fatalf("flag mode = %q, upstream = %q", cfg.Server.Mode, cfg.Upstream.URL)
+	}
+}
+
 func TestAdvancedChaosConfig(t *testing.T) {
 	path := writeConfig(t, `upstream:
   url: http://example.invalid
@@ -139,7 +180,12 @@ func TestInvalidStartupConfig(t *testing.T) {
 	}{
 		{"unknown field", "chaos:\n  request_delay:\n    typo: true\n", nil, "field typo not found"},
 		{"trailing document", "{}\n---\n{}", nil, "single YAML document"},
+		{"unknown mode", "", map[string]string{"SERVER_MODE": "udp"}, "server.mode"},
+		{"empty mode", "", map[string]string{"SERVER_MODE": ""}, "server.mode"},
+		{"HTTP upstream in TCP mode", "", map[string]string{"SERVER_MODE": ModeTCP}, "upstream.url"},
+		{"HTTP upstream in CONNECT mode", "", map[string]string{"SERVER_MODE": ModeConnect}, "upstream.url"},
 		{"bad env duration", "", map[string]string{"CHAOS_REQUEST_DELAY_MAX": "one second"}, "CHAOS_REQUEST_DELAY_MAX"},
+		{"negative tunnel timeout max", "", map[string]string{"CHAOS_TUNNEL_TIMEOUT_MAX": "-1s"}, "chaos.tunnel_timeout.max"},
 		{"bad max", "", map[string]string{"CHAOS_RESPONSE_DELAY_MAX": "-1s"}, "chaos.response_delay.max"},
 		{"bad limit", "", map[string]string{"CHAOS_MAX_ACTIVE_FAULTS": "0"}, "chaos.limits.max_active_faults"},
 		{"bad log level", "observability:\n  logging:\n    level: all\n", nil, "slog"},
@@ -205,6 +251,68 @@ func TestTokenRequiredForNonLoopbackProxy(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTunnelTokenValidation(t *testing.T) {
+	vars := map[string]string{
+		"SERVER_MODE":   ModeTCP,
+		"SERVER_LISTEN": ":8080",
+		"UPSTREAM_URL":  "backend:5432",
+	}
+	if _, err := load("", Overrides{}, env(vars)); err != nil {
+		t.Fatalf("TCP startup without a token: %v", err)
+	}
+	vars["CHAOS_TOKEN"] = "invalid,token"
+	vars["CHAOS_STRIP_CONTROL_HEADERS"] = "false"
+	if _, err := load("", Overrides{}, env(vars)); err != nil {
+		t.Fatalf("TCP startup with unused HTTP settings: %v", err)
+	}
+	vars["SERVER_MODE"] = ModeConnect
+	vars["CHAOS_STRIP_CONTROL_HEADERS"] = "true"
+	for _, token := range []string{"", "invalid,token"} {
+		vars["CHAOS_TOKEN"] = token
+		if _, err := load("", Overrides{}, env(vars)); err == nil || !strings.Contains(err.Error(), "CHAOS_TOKEN") {
+			t.Fatalf("CONNECT startup with missing or invalid token: %v", err)
+		}
+	}
+	vars["CHAOS_TOKEN"] = "test-token"
+	if _, err := load("", Overrides{}, env(vars)); err != nil {
+		t.Fatalf("CONNECT startup with a token: %v", err)
+	}
+}
+
+func TestTCPAddress(t *testing.T) {
+	valid := map[string]string{
+		"backend:1":                    "backend:1",
+		"tcp://backend.example.:65535": "backend.example.:65535",
+		"tcp://127.0.0.1:5432":         "127.0.0.1:5432",
+		"[::1]:5432":                   "[::1]:5432",
+		"tcp://[::1]:5432":             "[::1]:5432",
+		"tcp://[fe80::1%25eth0]:5432":  "[fe80::1%eth0]:5432",
+	}
+	for upstream, want := range valid {
+		t.Run(upstream, func(t *testing.T) {
+			addr, err := TCPAddress(upstream)
+			if err != nil || addr != want {
+				t.Fatalf("address = %q, err = %v, want %q", addr, err, want)
+			}
+		})
+	}
+	invalid := []string{
+		"", "backend", "backend:", ":5432", "tcp://:5432", "*:5432", "0.0.0.0:5432", "[::]:5432",
+		"[::ffff:0.0.0.0]:5432", "::1:5432", "[backend]:5432", "[127.0.0.1]:5432",
+		"backend:0", "backend:-1", "backend:+1", "backend:65536", "backend:postgres", "back end:5432",
+		"tcp://backend:5432/", "backend:5432/path", "tcp://backend:5432?", "backend:5432?debug",
+		"tcp://backend:5432#", "backend:5432#debug", "tcp://user:pass@backend:5432", "user@backend:5432",
+		"tcp:///backend:5432", "http://backend:5432", "bad..name:5432",
+	}
+	for _, upstream := range invalid {
+		t.Run(upstream, func(t *testing.T) {
+			if _, err := TCPAddress(upstream); err == nil {
+				t.Fatal("expected invalid upstream error")
 			}
 		})
 	}

@@ -42,14 +42,16 @@ spec:
               drop:
                 - ALL
           env:
+            - name: SERVER_MODE
+              value: {{ .Values.mode | quote }}
             - name: SERVER_LISTEN
-              value: ":8080"
+              value: {{ printf ":%v" .Values.service.port | quote }}
             - name: OBSERVABILITY_LISTEN
               value: ":9090"
             - name: UPSTREAM_URL
               value: {{ required "upstreamURL must point to the backend Service" .Values.upstreamURL | quote }}
             - name: CHAOS_ENABLED
-              value: {{ not (empty .Values.chaos.existingSecret.name) | quote }}
+              value: {{ ternary .Values.chaos.connectionReset.enabled (not (empty .Values.chaos.existingSecret.name)) (eq .Values.mode "tcp") | quote }}
             - name: CHAOS_ABORT_ENABLED
               value: {{ .Values.chaos.abort.enabled | quote }}
             - name: CHAOS_PROBABILITY_ENABLED
@@ -68,16 +70,18 @@ spec:
               value: {{ .Values.chaos.connectionReset.enabled | quote }}
             - name: CHAOS_CONNECTION_RESET_AFTER_BYTES
               value: {{ $afterBytes | quote }}
-            {{- with .Values.chaos.existingSecret.name }}
+            - name: CHAOS_TUNNEL_TIMEOUT_MAX
+              value: {{ .Values.chaos.tunnelTimeout.max | quote }}
+            {{- if and (ne .Values.mode "tcp") .Values.chaos.existingSecret.name }}
             - name: CHAOS_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ . | quote }}
-                  key: {{ required "chaos.existingSecret.key must name the token key" $.Values.chaos.existingSecret.key | quote }}
+                  name: {{ .Values.chaos.existingSecret.name | quote }}
+                  key: {{ required "chaos.existingSecret.key must name the token key" .Values.chaos.existingSecret.key | quote }}
             {{- end }}
           ports:
-            - name: http
-              containerPort: 8080
+            - name: {{ include "chaos-proxy.portName" . }}
+              containerPort: {{ .Values.service.port }}
             - name: admin
               containerPort: 9090
           readinessProbe:

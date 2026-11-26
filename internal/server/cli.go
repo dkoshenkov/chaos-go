@@ -19,10 +19,11 @@ func Main(args []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("chaos-proxy", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	path := flags.String("config", "", "path to a YAML configuration file")
+	mode := flags.String("mode", "", "override the proxy mode: http, tcp, or connect (default http)")
 	listen := flags.String("listen", "", "override the proxy listen address (default 127.0.0.1:8080)")
-	upstream := flags.String("upstream", "", "override the fixed upstream HTTP(S) URL")
+	upstream := flags.String("upstream", "", "override the fixed upstream (HTTP(S) URL, host:port, or tcp://host:port)")
 	flags.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: chaos-proxy [-config file] [-listen addr] [-upstream URL]")
+		_, _ = fmt.Fprintln(stderr, "Usage: chaos-proxy [-config file] [-mode http|tcp|connect] [-listen addr] [-upstream target]")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); errors.Is(err, flag.ErrHelp) {
@@ -37,6 +38,8 @@ func Main(args []string, stderr io.Writer) int {
 	var overrides config.Overrides
 	flags.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "mode":
+			overrides.Mode = mode
 		case "listen":
 			overrides.Listen = listen
 		case "upstream":

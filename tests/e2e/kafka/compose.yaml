@@ -1,0 +1,83 @@
+services:
+  broker:
+    image: apache/kafka:4.1.2
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CLIENT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENERS: CLIENT://:9092,INTERNAL://:29092,CONTROLLER://:29093
+      KAFKA_ADVERTISED_LISTENERS: CLIENT://adapter:19092,INTERNAL://broker:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: [CMD, /opt/kafka/bin/kafka-topics.sh, --bootstrap-server, broker:29092, --list]
+      interval: 3s
+      timeout: 10s
+      retries: 20
+    networks: [broker]
+
+  proxy:
+    image: ${CHAOS_PROXY_IMAGE:-chaos-proxy:kafka-smoke}
+    pull_policy: never
+    environment:
+      SERVER_MODE: connect
+      SERVER_LISTEN: :18080
+      UPSTREAM_URL: tcp://broker:9092
+      OBSERVABILITY_LISTEN: :9090
+      CHAOS_REQUEST_DELAY_ENABLED: "true"
+      CHAOS_CONNECTION_RESET_ENABLED: "true"
+      CHAOS_TOKEN: kafka-smoke-token
+    depends_on:
+      broker:
+        condition: service_healthy
+    networks: [broker]
+
+  adapter:
+    image: ${CHAOS_PROXY_IMAGE:-chaos-proxy:kafka-smoke}
+    pull_policy: never
+    entrypoint: [/chaos-tunnel]
+    command:
+      - -listen
+      - :19092
+      - -proxy
+      - proxy:18080
+      - -target
+      - broker:9092
+      - -header
+      - "X-Chaos-Request-Delay-Ms: 10"
+    environment:
+      CHAOS_TOKEN: kafka-smoke-token
+    depends_on: [proxy]
+    networks: [client, broker]
+
+  adapter-reset:
+    extends:
+      service: adapter
+    profiles: [reset]
+    command:
+      - -listen
+      - :19092
+      - -proxy
+      - proxy:18080
+      - -target
+      - broker:9092
+      - -header
+      - "X-Chaos-Connection-Reset: true"
+
+  client:
+    image: apache/kafka:4.1.2
+    profiles: [tools]
+    entrypoint: []
+    environment:
+      KAFKA_HEAP_OPTS: -Xms64m -Xmx256m
+    networks: [client]
+
+networks:
+  broker:
+  client:
