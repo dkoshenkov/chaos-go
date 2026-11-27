@@ -28,16 +28,16 @@ const (
 
 var errConnectHeaderTooLarge = errors.New("CONNECT headers exceed 32 KiB")
 
-// ServeConnect accepts HTTP/1.1 CONNECT handshakes for one fixed upstream.
-func ServeConnect(ctx context.Context, listener net.Listener, opts Options, settings chaos.Settings, maxTimeout, headerTimeout, shutdownTimeout time.Duration, observer *observability.Observer) error {
+// NewConnectServer configures HTTP/1.1 CONNECT for one fixed upstream.
+func NewConnectServer(opts Options, settings chaos.Settings, maxTimeout, headerTimeout time.Duration, observer *observability.Observer) (*ConnectServer, error) {
 	target, err := parseConnectAuthority(opts.Upstream)
 	if err != nil {
-		return fmt.Errorf("invalid CONNECT upstream: %w", err)
+		return nil, fmt.Errorf("invalid CONNECT upstream: %w", err)
 	}
 	if maxTimeout < 0 || headerTimeout <= 0 || opts.DialTimeout < 0 || settings.MaxActiveFaults < 0 || settings.ResetAfterBytes < 0 {
-		return errors.New("invalid CONNECT proxy limits")
+		return nil, errors.New("invalid CONNECT proxy limits")
 	}
-	h := connectServer{
+	h := &ConnectServer{
 		upstream:      opts.Upstream,
 		target:        target,
 		dialer:        net.Dialer{Timeout: opts.DialTimeout},
@@ -47,10 +47,16 @@ func ServeConnect(ctx context.Context, listener net.Listener, opts Options, sett
 		active:        make(chan struct{}, settings.MaxActiveFaults),
 		observer:      observer,
 	}
+	return h, nil
+}
+
+// Serve accepts CONNECT handshakes and drains the tunnels on shutdown.
+func (h *ConnectServer) Serve(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration) error {
 	return serve(ctx, listener, shutdownTimeout, h.handle)
 }
 
-type connectServer struct {
+// ConnectServer serves CONNECT tunnels and their live policy updates.
+type ConnectServer struct {
 	upstream      string
 	target        connectAuthority
 	dialer        net.Dialer
@@ -59,9 +65,10 @@ type connectServer struct {
 	headerTimeout time.Duration
 	active        chan struct{}
 	observer      *observability.Observer
+	live          *livePolicies
 }
 
-func (h *connectServer) handle(ctx context.Context, conn net.Conn) {
+func (h *ConnectServer) handle(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	stopShutdown := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopShutdown()
@@ -124,7 +131,7 @@ func (h *connectServer) handle(ctx context.Context, conn net.Conn) {
 		select {
 		case h.active <- struct{}{}:
 			slotHeld = true
-			tcpObservation.Fault()
+			tcpObservation.SetFaultActive(true)
 		default:
 			h.respond(client, http.StatusTooManyRequests, observation)
 			return
@@ -137,7 +144,7 @@ func (h *connectServer) handle(ctx context.Context, conn net.Conn) {
 		result.outcome = "io_error"
 		return
 	}
-	result = h.tunnel(ctx, client, reader, received, policy, timeout, observation, tcpObservation)
+	result = h.tunnel(ctx, client, reader, received, policy, timeout, slotHeld, observation, tcpObservation)
 }
 
 type connectRequest struct {
@@ -147,7 +154,7 @@ type connectRequest struct {
 	header   http.Header
 }
 
-func (h *connectServer) validateRequest(request connectRequest) int {
+func (h *ConnectServer) validateRequest(request connectRequest) int {
 	if request.protocol != "HTTP/1.1" {
 		return http.StatusBadRequest
 	}
@@ -256,14 +263,17 @@ func readConnectRequest(reader *bufio.Reader) (connectRequest, error) {
 	return request, err
 }
 
-func (h *connectServer) parsePolicy(headers http.Header) (chaos.Policy, time.Duration, int) {
+func (h *ConnectServer) parsePolicy(headers http.Header) (chaos.Policy, time.Duration, int) {
 	if !h.settings.Enabled || !chaos.HasControls(headers) {
 		return chaos.Policy{}, 0, 0
 	}
 	if !chaos.Authorized(headers, h.settings.Token) {
 		return chaos.Policy{}, 0, http.StatusForbidden
 	}
+	return h.parseControls(headers)
+}
 
+func (h *ConnectServer) parseControls(headers http.Header) (chaos.Policy, time.Duration, int) {
 	var timeout time.Duration
 	if values, ok := headers[connectTimeoutHeader]; ok {
 		if len(values) != 1 {
@@ -283,7 +293,7 @@ func (h *connectServer) parsePolicy(headers http.Header) (chaos.Policy, time.Dur
 	return policy, timeout, 0
 }
 
-func (h *connectServer) tunnel(ctx context.Context, client tcpConn, reader *bufio.Reader, received time.Time, policy chaos.Policy, timeout time.Duration, observation *observability.Request, tcpObservation *observability.TCPConnection) relayResult {
+func (h *ConnectServer) tunnel(ctx context.Context, client tcpConn, reader *bufio.Reader, received time.Time, policy chaos.Policy, timeout time.Duration, slotHeld bool, observation *observability.Request, tcpObservation *observability.TCPConnection) relayResult {
 	tunnelCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -360,6 +370,13 @@ func (h *connectServer) tunnel(ctx context.Context, client tcpConn, reader *bufi
 			},
 		}
 	}
+	if h.live != nil {
+		live := h.live.attach(tunnelCtx, tcpObservation, slotHeld)
+		defer h.live.detach(live)
+		tunnelCtx = live.ctx
+		client = &liveWriter{tcpConn: client, tunnel: live, direction: "response"}
+		upstream = &liveWriter{tcpConn: upstream, tunnel: live, direction: "request"}
+	}
 	result := bridge(tunnelCtx, client, reader, upstream, nil, resetAfterBytes)
 	if result.outcome == "shutdown" && errors.Is(tunnelCtx.Err(), context.DeadlineExceeded) {
 		result.outcome = "timeout"
@@ -435,7 +452,7 @@ func waitConnect(ctx context.Context, observe func(string, time.Duration, time.D
 	return err
 }
 
-func (h *connectServer) canceledHandshake(ctx, tunnelCtx context.Context, client net.Conn, observation *observability.Request) relayResult {
+func (h *ConnectServer) canceledHandshake(ctx, tunnelCtx context.Context, client net.Conn, observation *observability.Request) relayResult {
 	outcome := connectFailure(ctx, tunnelCtx)
 	switch outcome {
 	case "timeout":
@@ -458,7 +475,7 @@ func connectFailure(ctx, tunnelCtx context.Context) string {
 	}
 }
 
-func (h *connectServer) respond(conn net.Conn, status int, observation *observability.Request) {
+func (h *ConnectServer) respond(conn net.Conn, status int, observation *observability.Request) {
 	err := conn.SetWriteDeadline(time.Now().Add(h.headerTimeout))
 	if err == nil {
 		allow := ""

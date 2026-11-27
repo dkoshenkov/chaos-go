@@ -26,7 +26,7 @@ func TestAdminHandler(t *testing.T) {
 	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprintln(w, "test_metrics 1")
 	})
-	handler := adminHandler(&ready, metrics)
+	handler := adminHandler(&ready, metrics, nil)
 	for _, tt := range []struct {
 		path   string
 		status int
@@ -50,7 +50,7 @@ func TestAdminHandler(t *testing.T) {
 		t.Fatalf("/version returned status %d, metadata %+v, decode error %v", response.Code, info, err)
 	}
 	response = httptest.NewRecorder()
-	adminHandler(&ready, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	adminHandler(&ready, nil, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if response.Code != http.StatusNotFound {
 		t.Errorf("disabled /metrics status = %d, want 404", response.Code)
 	}
