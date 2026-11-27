@@ -35,16 +35,21 @@ func (o *Observer) BeginTCP() *TCPConnection {
 	return connection
 }
 
-// Fault records that the connection holds a fault slot until it finishes.
-func (c *TCPConnection) Fault() {
+// SetFaultActive records whether the connection holds a fault slot.
+func (c *TCPConnection) SetFaultActive(active bool) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.finished && !c.faultActive {
-		c.faultActive = true
+	if c.finished || c.faultActive == active {
+		return
+	}
+	c.faultActive = active
+	if active {
 		c.observer.activeFaults.Inc()
+	} else {
+		c.observer.activeFaults.Dec()
 	}
 }
 

@@ -52,7 +52,7 @@ func Serve(ctx context.Context, listener net.Listener, opts Options, shutdownTim
 			select {
 			case activeFaults <- struct{}{}:
 				slotHeld = true
-				observation.Fault()
+				observation.SetFaultActive(true)
 			default:
 				result.outcome = "limited"
 				return
@@ -152,9 +152,10 @@ type relayResult struct {
 
 func bridge(ctx context.Context, downstream tcpConn, downstreamReader io.Reader, upstream tcpConn, upstreamReader io.Reader, resetAfterBytes int64) relayResult {
 	if ctx.Err() != nil {
-		_ = downstream.Close()
+		var result relayResult
+		result.cancel(ctx, downstream)
 		_ = upstream.Close()
-		return relayResult{outcome: "shutdown", err: ctx.Err()}
+		return result
 	}
 	if downstreamReader == nil {
 		downstreamReader = downstream
@@ -181,14 +182,9 @@ func bridge(ctx context.Context, downstream tcpConn, downstreamReader io.Reader,
 		}
 		switch {
 		case ctx.Err() != nil:
-			result.outcome = "shutdown"
-			result.err = ctx.Err()
-			_ = downstream.Close()
+			result.cancel(ctx, downstream)
 		case reset:
-			result.outcome = "reset"
-			if result.err = resetTCP(downstream); result.err != nil {
-				result.outcome = "io_error"
-			}
+			result.reset(downstream)
 		case result.err != nil:
 			result.outcome = "io_error"
 			if errors.Is(result.err, syscall.ECONNRESET) || errors.Is(result.err, syscall.EPIPE) {
@@ -210,6 +206,27 @@ func bridge(ctx context.Context, downstream tcpConn, downstreamReader io.Reader,
 		break
 	}
 	return result
+}
+
+func (r *relayResult) cancel(ctx context.Context, downstream tcpConn) {
+	r.err = ctx.Err()
+	switch context.Cause(ctx) {
+	case errLiveReset:
+		r.reset(downstream)
+		return
+	case errLiveTimeout:
+		r.outcome = "timeout"
+	default:
+		r.outcome = "shutdown"
+	}
+	_ = downstream.Close()
+}
+
+func (r *relayResult) reset(downstream tcpConn) {
+	r.outcome = "reset"
+	if r.err = resetTCP(downstream); r.err != nil {
+		r.outcome = "io_error"
+	}
 }
 
 type copyResult struct {

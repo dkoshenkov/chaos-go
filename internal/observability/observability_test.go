@@ -196,8 +196,8 @@ func TestTCPMetricsAndLog(t *testing.T) {
 func TestTCPFaultMetrics(t *testing.T) {
 	observer := New(nil)
 	connection := observer.BeginTCP()
-	connection.Fault()
-	connection.Fault()
+	connection.SetFaultActive(true)
+	connection.SetFaultActive(true)
 	assertSamples(t, scrapeMetrics(t, observer), `chaos_proxy_active_faults 1`)
 
 	connection.Wait("response", 25*time.Millisecond, 20*time.Millisecond, true, true)
@@ -205,7 +205,7 @@ func TestTCPFaultMetrics(t *testing.T) {
 	connection.Finish("reset", 0, 10)
 	connection.Finish("reset", 0, 10)
 	connection.Wait("response", time.Second, time.Second, true, true)
-	connection.Fault()
+	connection.SetFaultActive(true)
 	assertSamples(t, scrapeMetrics(t, observer),
 		`chaos_proxy_active_faults 0`,
 		`chaos_proxy_injections_total{direction="response",fault_type="connection_reset"} 1`,
@@ -229,7 +229,7 @@ func TestNilObserver(t *testing.T) {
 	request.Invalid()
 	request.Finish(http.StatusOK, false)
 	connection := observer.BeginTCP()
-	connection.Fault()
+	connection.SetFaultActive(true)
 	connection.Wait("response", time.Second, time.Second, true, false)
 	connection.Finish("closed", 0, 0)
 }

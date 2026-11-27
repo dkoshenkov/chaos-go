@@ -342,14 +342,23 @@ func startConnectTestProxy(t *testing.T, broker net.Listener, settings chaos.Set
 
 func startConnectTestProxyWithObserver(t *testing.T, broker net.Listener, settings chaos.Settings, maxTimeout, headerTimeout time.Duration, observer *observability.Observer) (string, context.CancelFunc, <-chan struct{}) {
 	t.Helper()
+	opts := Options{Upstream: broker.Addr().String(), DialTimeout: time.Second}
+	proxy, err := NewConnectServer(opts, settings, maxTimeout, headerTimeout, observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return serveConnectTestProxy(t, proxy)
+}
+
+func serveConnectTestProxy(t *testing.T, proxy *ConnectServer) (string, context.CancelFunc, <-chan struct{}) {
+	t.Helper()
 	listener := connectTestListener(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		opts := Options{Upstream: broker.Addr().String(), DialTimeout: time.Second}
-		if err := ServeConnect(ctx, listener, opts, settings, maxTimeout, headerTimeout, 80*time.Millisecond, observer); err != nil {
-			t.Errorf("ServeConnect: %v", err)
+		if err := proxy.Serve(ctx, listener, 80*time.Millisecond); err != nil {
+			t.Errorf("Serve: %v", err)
 		}
 	}()
 	t.Cleanup(func() {

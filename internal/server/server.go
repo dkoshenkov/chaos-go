@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -105,10 +106,19 @@ func tcpDataServer(cfg config.Config, settings chaos.Settings, observer *observa
 		opts.Probability = settings.DefaultProbability
 	}
 	if cfg.Server.Mode == config.ModeConnect {
-		return dataServer{serve: func(ctx context.Context, listener net.Listener) error {
-			return tcpproxy.ServeConnect(ctx, listener, opts, settings, cfg.Chaos.TunnelTimeout.Max,
-				cfg.Server.ReadHeaderTimeout, cfg.Server.ShutdownTimeout, observer)
-		}}, nil
+		connect, err := tcpproxy.NewConnectServer(opts, settings, cfg.Chaos.TunnelTimeout.Max, cfg.Server.ReadHeaderTimeout, observer)
+		if err != nil {
+			return dataServer{}, err
+		}
+		data := dataServer{serve: func(ctx context.Context, listener net.Listener) error {
+			return connect.Serve(ctx, listener, cfg.Server.ShutdownTimeout)
+		}}
+		adminHost, _, _ := net.SplitHostPort(cfg.Observability.Listen)
+		adminIP, _ := netip.ParseAddr(adminHost)
+		if settings.Enabled && (settings.Token != "" || adminIP.Unmap().IsLoopback()) {
+			data.connectPolicy = connect.EnableLivePolicy()
+		}
+		return data, nil
 	}
 	return dataServer{serve: func(ctx context.Context, listener net.Listener) error {
 		return tcpproxy.Serve(ctx, listener, opts, cfg.Server.ShutdownTimeout, observer)
@@ -135,8 +145,9 @@ func upstreamTransport(cfg config.Upstream) *http.Transport {
 }
 
 type dataServer struct {
-	serve    func(context.Context, net.Listener) error
-	shutdown func(context.Context) error
+	serve         func(context.Context, net.Listener) error
+	shutdown      func(context.Context) error
+	connectPolicy http.Handler
 }
 
 func httpDataServer(cfg config.Server, handler http.Handler) dataServer {
@@ -165,7 +176,7 @@ func serve(ctx context.Context, cfg config.Server, proxyListener, adminListener 
 	adminServer := &http.Server{
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
-		Handler:           adminHandler(&ready, metrics),
+		Handler:           adminHandler(&ready, metrics, data.connectPolicy),
 	}
 	// Let readiness drop before the data listener starts draining.
 	dataCtx, stopData := context.WithCancel(context.WithoutCancel(ctx))
@@ -217,7 +228,7 @@ func shutdownHTTP(ctx context.Context, server *http.Server, name string) error {
 	return nil
 }
 
-func adminHandler(ready *atomic.Bool, metrics http.Handler) http.Handler {
+func adminHandler(ready *atomic.Bool, metrics, connectPolicy http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprintln(w, "ok")
@@ -231,6 +242,10 @@ func adminHandler(ready *atomic.Bool, metrics http.Handler) http.Handler {
 	})
 	if metrics != nil {
 		mux.Handle("GET /metrics", metrics)
+	}
+	if connectPolicy != nil {
+		mux.Handle("PUT /connect/policy", connectPolicy)
+		mux.Handle("DELETE /connect/policy", connectPolicy)
 	}
 	info := currentVersion()
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, _ *http.Request) {
