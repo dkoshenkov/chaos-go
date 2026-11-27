@@ -122,7 +122,7 @@ func upstreamTransport(cfg config.Upstream) *http.Transport {
 	protocols.SetHTTP2(true)
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
+		DialContext:           pooledUploadDial(dialer.DialContext),
 		Protocols:             protocols,
 		DisableCompression:    true,
 		MaxIdleConns:          cfg.MaxIdleConnections,
