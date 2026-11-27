@@ -118,6 +118,7 @@ func TestConnectRejectsInvalidHandshake(t *testing.T) {
 		{"duplicate token", connectTestRequest(target, token+token), http.StatusForbidden},
 		{"unknown control", connectTestRequest(target, token+"X-Chaos-Unknown: yes\r\n"), http.StatusBadRequest},
 		{"duplicate delay", connectTestRequest(target, token+"X-Chaos-Request-Delay-Ms: 1\r\nx-ChAoS-rEqUeSt-DeLaY-mS: 2\r\n"), http.StatusBadRequest},
+		{"pause requires the admin endpoint", connectTestRequest(target, token+"X-Chaos-Pause: true\r\n"), http.StatusBadRequest},
 		{"folded control", connectTestRequest(target, token+"X-Chaos-Request-Delay-Ms:\r\n 1\r\n"), http.StatusBadRequest},
 		{"space in name", connectTestRequest(target, token+"X-Chaos-Request-Delay-Ms : 1\r\n"), http.StatusBadRequest},
 		{"unsupported status", connectTestRequest(target, token+"X-Chaos-Status-Code: 502\r\n"), http.StatusBadRequest},

@@ -371,11 +371,11 @@ func (h *ConnectServer) tunnel(ctx context.Context, client tcpConn, reader *bufi
 		}
 	}
 	if h.live != nil {
-		live := h.live.attach(tunnelCtx, tcpObservation, slotHeld)
+		live := h.live.attach(tunnelCtx, client, upstream, tcpObservation, slotHeld)
 		defer h.live.detach(live)
 		tunnelCtx = live.ctx
-		client = &liveWriter{tcpConn: client, tunnel: live, direction: "response"}
-		upstream = &liveWriter{tcpConn: upstream, tunnel: live, direction: "request"}
+		client = &live.downstream
+		upstream = &live.upstream
 	}
 	result := bridge(tunnelCtx, client, reader, upstream, nil, resetAfterBytes)
 	if result.outcome == "shutdown" && errors.Is(tunnelCtx.Err(), context.DeadlineExceeded) {

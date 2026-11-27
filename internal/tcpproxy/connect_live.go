@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"github.com/dkoshenkov/chaos-go/internal/chaos"
 	"github.com/dkoshenkov/chaos-go/internal/observability"
 )
+
+const connectPauseHeader = "X-Chaos-Pause"
 
 var (
 	errLiveReset   = errors.New("live CONNECT reset")
@@ -36,22 +40,43 @@ func (h *ConnectServer) updateLivePolicy(w http.ResponseWriter, r *http.Request)
 	}
 	var next livePolicy
 	if r.Method == http.MethodPut {
-		policy, timeout, status := h.parseControls(r.Header)
+		var status int
+		next, status = h.parseLivePolicy(r.Header.Clone())
 		if status != 0 {
 			w.WriteHeader(status)
 			return
-		}
-		if policy.HasFault() || timeout > 0 {
-			next = livePolicy{policy: policy, timeout: timeout}
 		}
 	}
 	h.live.update(next)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *ConnectServer) parseLivePolicy(headers http.Header) (livePolicy, int) {
+	var pause bool
+	if values, ok := headers[connectPauseHeader]; ok {
+		if len(values) != 1 {
+			return livePolicy{}, http.StatusBadRequest
+		}
+		switch strings.ToLower(strings.Trim(values[0], " \t")) {
+		case "true":
+			pause = true
+		case "false":
+		default:
+			return livePolicy{}, http.StatusBadRequest
+		}
+		headers.Del(connectPauseHeader)
+	}
+	policy, timeout, status := h.parseControls(headers)
+	if status != 0 || (!pause && !policy.HasFault() && timeout == 0) {
+		return livePolicy{}, status
+	}
+	return livePolicy{policy: policy, timeout: timeout, pause: pause}, 0
+}
+
 type livePolicy struct {
 	policy  chaos.Policy
 	timeout time.Duration
+	pause   bool
 }
 
 type livePolicies struct {
@@ -66,6 +91,8 @@ type liveTunnel struct {
 	owner       *livePolicies
 	ctx         context.Context
 	cancel      context.CancelCauseFunc
+	downstream  liveWriter
+	upstream    liveWriter
 	observation *observability.TCPConnection
 	handshake   bool // The CONNECT policy already holds a slot for this tunnel.
 	fault       atomic.Pointer[liveFault]
@@ -77,12 +104,21 @@ type liveFault struct {
 	timer     *time.Timer
 	policy    chaos.Policy
 	sampled   chaos.Policy
+	pause     bool
 	remaining int64 // Accessed only by the response writer.
 }
 
-func (p *livePolicies) attach(ctx context.Context, observation *observability.TCPConnection, handshake bool) *liveTunnel {
+func (p *livePolicies) attach(ctx context.Context, downstream, upstream tcpConn, observation *observability.TCPConnection, handshake bool) *liveTunnel {
 	ctx, cancel := context.WithCancelCause(ctx)
-	t := &liveTunnel{owner: p, ctx: ctx, cancel: cancel, observation: observation, handshake: handshake}
+	t := &liveTunnel{
+		owner:       p,
+		ctx:         ctx,
+		cancel:      cancel,
+		observation: observation,
+		handshake:   handshake,
+	}
+	t.downstream = liveWriter{tcpConn: downstream, tunnel: t, direction: "response"}
+	t.upstream = liveWriter{tcpConn: upstream, tunnel: t, direction: "request"}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.tunnels[t] = struct{}{}
@@ -136,11 +172,10 @@ func (p *livePolicies) apply(t *liveTunnel, next livePolicy) {
 		cancel:    cancel,
 		policy:    next.policy,
 		sampled:   next.policy.SampleJitter(p.settings),
+		pause:     next.pause,
 		remaining: p.settings.ResetAfterBytes,
 	}
-	if previous := t.fault.Swap(f); previous != nil {
-		previous.stop()
-	}
+	t.setFault(f)
 	if f.policy.ConnectionReset && p.settings.ResetAfterBytes == 0 {
 		t.cancel(errLiveReset)
 	} else if next.timeout > 0 {
@@ -149,13 +184,39 @@ func (p *livePolicies) apply(t *liveTunnel, next livePolicy) {
 }
 
 func (p *livePolicies) clear(t *liveTunnel) {
-	if previous := t.fault.Swap(nil); previous != nil {
-		previous.stop()
-		if !t.handshake {
-			t.observation.SetFaultActive(false)
-			<-p.active
+	if t.setFault(nil) != nil && !t.handshake {
+		t.observation.SetFaultActive(false)
+		<-p.active
+	}
+}
+
+// setFault runs with the policy lock held. Write deadlines interrupt writes
+// already blocked on a full socket when a pause is installed.
+func (t *liveTunnel) setFault(next *liveFault) *liveFault {
+	previous := t.fault.Load()
+	wasPaused := previous != nil && previous.pause
+	paused := next != nil && next.pause
+	if wasPaused && !paused {
+		t.setWriteDeadline(time.Time{})
+	}
+	t.fault.Store(next)
+	if paused && !wasPaused {
+		t.setWriteDeadline(time.Now())
+		// Both writers must leave any previous socket write before PUT returns.
+		for _, w := range []*liveWriter{&t.downstream, &t.upstream} {
+			w.mu.Lock()
+			w.mu.Unlock()
 		}
 	}
+	if previous != nil {
+		previous.stop()
+	}
+	return previous
+}
+
+func (t *liveTunnel) setWriteDeadline(deadline time.Time) {
+	_ = t.downstream.SetWriteDeadline(deadline)
+	_ = t.upstream.SetWriteDeadline(deadline)
 }
 
 func (f *liveFault) stop() {
@@ -180,6 +241,7 @@ type liveWriter struct {
 	tcpConn
 	tunnel    *liveTunnel
 	direction string
+	mu        sync.Mutex // Held only during a socket write.
 }
 
 func (w *liveWriter) Close() error {
@@ -195,40 +257,54 @@ func (w *liveWriter) Write(p []byte) (int, error) {
 			return written, err
 		}
 		f := t.fault.Load()
-		if f == nil {
-			n, err := w.tcpConn.Write(p)
-			return written + n, err
-		}
-
-		effective, base, jitter := f.sampled.RequestDelay, f.policy.RequestDelay, f.policy.RequestJitter
-		if w.direction == "response" {
-			effective, base, jitter = f.sampled.ResponseDelay, f.policy.ResponseDelay, f.policy.ResponseJitter
-		}
-		if err := waitConnect(f.ctx, t.observation.Wait, w.direction, effective, base, jitter); err != nil || t.fault.Load() != f {
+		if f != nil && !w.waitForWrite(f) {
 			// Keep the same bytes and recheck the current policy after an update.
 			continue
 		}
 
 		size := len(p)
-		reset := w.direction == "response" && f.policy.ConnectionReset
+		reset := f != nil && w.direction == "response" && f.policy.ConnectionReset
 		if reset {
 			size = int(min(int64(size), f.remaining))
 		}
+		w.mu.Lock()
+		if t.fault.Load() != f {
+			w.mu.Unlock()
+			continue
+		}
 		n, err := w.tcpConn.Write(p[:size])
+		w.mu.Unlock()
 		written += n
+		p = p[n:]
+		if reset {
+			f.remaining -= int64(n)
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			// The pause interrupted this write. Retry only the unsent bytes.
+			continue
+		}
 		if err != nil {
 			return written, err
 		}
 		if n != size {
 			return written, io.ErrShortWrite
 		}
-		if reset {
-			f.remaining -= int64(n)
-			if f.remaining == 0 && t.terminate(f, errLiveReset) {
-				return written, errLiveReset
-			}
+		if reset && f.remaining == 0 && t.terminate(f, errLiveReset) {
+			return written, errLiveReset
 		}
-		p = p[n:]
 	}
 	return written, nil
+}
+
+func (w *liveWriter) waitForWrite(f *liveFault) bool {
+	if f.pause {
+		<-f.ctx.Done()
+		return false
+	}
+	effective, base, jitter := f.sampled.RequestDelay, f.policy.RequestDelay, f.policy.RequestJitter
+	if w.direction == "response" {
+		effective, base, jitter = f.sampled.ResponseDelay, f.policy.ResponseDelay, f.policy.ResponseJitter
+	}
+	t := w.tunnel
+	return waitConnect(f.ctx, t.observation.Wait, w.direction, effective, base, jitter) == nil
 }
